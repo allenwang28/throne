@@ -38,8 +38,19 @@ def cmd_start(args):
 
         print(f"Starting cluster '{cluster.name}'...")
 
+        # Apply controller env if provided by spec
+        controller_env = getattr(cluster, "_controller_env", {}) or {}
+        if controller_env:
+            os.environ.update({k: str(v) for k, v in controller_env.items()})
+
         # Apply the job (start it)
-        cluster._job.apply()
+        try:
+            cluster._job.apply()
+        except RuntimeError as e:
+            msg = str(e)
+            print(f"Error starting cluster via sbatch: {msg}", file=sys.stderr)
+            print("Hint: verify your SLURM settings (partition/qos/account) with `sinfo -s` or `scontrol show partition`.", file=sys.stderr)
+            sys.exit(1)
 
         # Save state (this will print save info from Cluster.save())
         cluster.save()
@@ -47,6 +58,9 @@ def cmd_start(args):
         print(f"\n✓ Cluster '{cluster.name}' started successfully")
         print(f"  ID: {cluster.cluster_id}")
         print(f"  State saved to: {cluster._cluster_path}")
+        job_id = getattr(cluster._job, "_slurm_job_id", None)
+        if job_id:
+            print(f"  SLURM Job ID: {job_id}")
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -73,6 +87,11 @@ def cmd_stop(args):
 
         # Kill the job
         cluster.kill()
+        # Remove saved state
+        try:
+            cluster.cleanup()
+        except Exception as e:
+            print(f"Warning: failed to remove cluster state: {e}", file=sys.stderr)
 
         print(f"✓ Cluster '{cluster.name}' stopped")
 
@@ -99,27 +118,18 @@ def cmd_list(args):
         if cluster_dir.is_dir() and (cluster_dir / "job_state.pkl").exists():
             metadata_path = cluster_dir / "metadata.txt"
 
-            # Read metadata if available
-            cluster_id = "unknown"
-            created = "unknown"
-            job_type = "unknown"
+            metadata = Cluster._parse_metadata(metadata_path)
 
-            if metadata_path.exists():
-                metadata = metadata_path.read_text()
-                for line in metadata.split('\n'):
-                    if line.startswith('ID:'):
-                        cluster_id = line.split(':', 1)[1].strip()
-                    elif line.startswith('Created:'):
-                        created = line.split(':', 1)[1].strip()
-                    elif line.startswith('Job Type:'):
-                        job_type = line.split(':', 1)[1].strip()
-
-            clusters.append({
-                'name': cluster_dir.name,
-                'id': cluster_id,
-                'created': created,
-                'type': job_type,
-            })
+            clusters.append(
+                {
+                    'name': cluster_dir.name,
+                    'id': metadata.get('ID', 'unknown'),
+                    'created': metadata.get('Created', 'unknown'),
+                    'type': metadata.get('Job Type', 'unknown'),
+                    'job_id': metadata.get('Job ID', '-'),
+                    'partition': metadata.get('Partition', '-'),
+                }
+            )
 
     if not clusters:
         print("No clusters found")
@@ -127,13 +137,13 @@ def cmd_list(args):
 
     print(f"Clusters in {state_dir}:")
     print("-" * 80)
-    print(f"{'NAME':<20} {'ID':<12} {'TYPE':<15} {'CREATED':<30}")
+    print(f"{'NAME':<20} {'ID':<12} {'TYPE':<15} {'JOBID':<12} {'PARTITION':<12} {'CREATED':<20}")
     print("-" * 80)
 
     for cluster in clusters:
         # Truncate created timestamp for display
         created = cluster['created'][:19] if len(cluster['created']) > 19 else cluster['created']
-        print(f"{cluster['name']:<20} {cluster['id']:<12} {cluster['type']:<15} {created:<30}")
+        print(f"{cluster['name']:<20} {cluster['id']:<12} {cluster['type']:<15} {cluster['job_id']:<12} {cluster['partition']:<12} {created:<20}")
 
 
 def cmd_info(args):
@@ -157,10 +167,14 @@ def cmd_info(args):
         metadata_path = cluster._cluster_path / "metadata.txt"
         if metadata_path.exists():
             print(f"\nMetadata:")
-            metadata = metadata_path.read_text()
-            for line in metadata.split('\n'):
-                if line.strip() and not line.startswith('State Path'):
-                    print(f"  {line}")
+            metadata = Cluster._parse_metadata(metadata_path)
+            for key, value in metadata.items():
+                if key == 'SBATCH':
+                    print("  SBATCH directives:")
+                    for line in value.split(" | "):
+                        print(f"    {line}")
+                elif key != 'State Path':
+                    print(f"  {key}: {value}")
 
         # Note: We skip job state info because calling job.state()
         # spawns background threads that cause threading crashes on cleanup.
@@ -176,6 +190,8 @@ def cmd_info(args):
 
 def cmd_run(args):
     """Run a Python script with cluster context."""
+    import subprocess
+
     try:
         # Load cluster
         state_dir = get_state_dir()
@@ -186,14 +202,31 @@ def cmd_run(args):
         # Set environment variable so the script can find the cluster
         os.environ["THRONE_CLUSTER"] = cluster.name
         os.environ["THRONE_STATE_DIR"] = str(state_dir)
+        # Apply controller env if provided by spec
+        controller_env = getattr(cluster, "_controller_env", {}) or {}
+        os.environ.update({k: str(v) for k, v in controller_env.items()})
 
-        # Execute the script
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, args.script] + args.script_args,
-            env=os.environ.copy()
-        )
-        sys.exit(result.returncode)
+        # Execute the script with cleanup on interrupt/errors
+        env = os.environ.copy()
+        try:
+            result = subprocess.run(
+                [sys.executable, args.script] + args.script_args,
+                env=env,
+            )
+            returncode = result.returncode
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt: requested stop. Cleaning up spawned procs (cluster left intact).", file=sys.stderr)
+            returncode = 130
+        except Exception as e:
+            print(f"Error running script: {e}", file=sys.stderr)
+            returncode = 1
+
+        if returncode != 0 and hasattr(cluster._job, "active"):
+            if not cluster._job.active:
+                print("Underlying job is no longer active; consider restarting the cluster.", file=sys.stderr)
+
+        # Preserve script return code
+        sys.exit(returncode)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
